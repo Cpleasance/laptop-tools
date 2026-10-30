@@ -1,0 +1,12 @@
+[Unit]
+Description=Post-resume health checks (OpenSnitch, DNS, fingerprint, kernel, units)
+After=graphical-session.target dbus.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/resumecheck
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

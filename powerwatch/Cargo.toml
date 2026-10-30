@@ -1,0 +1,12 @@
+[package]
+name = "powerwatch"
+version = "0.1.0"
+edition = "2024"
+description = "User-level daemon that trims power use when the laptop goes on battery"
+
+[dependencies]
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+futures-util = { version = "0.3", default-features = false }
