@@ -2,13 +2,20 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 const DEBOUNCE: Duration = Duration::from_secs(5);
+const RESTORE_RETRY: Duration = Duration::from_secs(30);
+const FLAP_WINDOW: Duration = Duration::from_secs(5 * 60);
+const FLAP_ALERT_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const FLAP_THRESHOLD: usize = 4;
+const LOW_BATTERY_HYSTERESIS: u8 = 5;
+const TRANSITION_HISTORY: usize = 10;
 
 // ---------- logging ----------
 
@@ -31,6 +38,8 @@ struct Config {
     notify: bool,
     on_battery_cmds: Vec<String>,
     on_ac_cmds: Vec<String>,
+    low_battery_threshold: u8,
+    on_low_battery_cmds: Vec<String>,
 }
 
 impl Default for Config {
@@ -42,8 +51,16 @@ impl Default for Config {
             notify: true,
             on_battery_cmds: vec![],
             on_ac_cmds: vec![],
+            low_battery_threshold: 15,
+            on_low_battery_cmds: vec![],
         }
     }
+}
+
+#[derive(Deserialize, Serialize, Default, Debug, PartialEq, Clone)]
+struct PowerTransition {
+    at_unix_seconds: u64,
+    on_battery: bool,
 }
 
 #[derive(Deserialize, Serialize, Default, Debug, PartialEq, Clone)]
@@ -58,6 +75,10 @@ struct State {
     /// Wi-Fi connection whose powersave we changed, and its original value.
     wifi_con: Option<String>,
     wifi_prev: Option<String>,
+    /// Prevent repeatedly running low-battery actions until the battery recovers.
+    low_battery_alerted: bool,
+    /// Last stable power transitions, for `powerwatch status`.
+    recent_transitions: Vec<PowerTransition>,
 }
 
 impl State {
@@ -68,7 +89,9 @@ impl State {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
@@ -86,6 +109,36 @@ fn state_path() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("powerwatch/state.toml")
 }
 
+fn read_battery_capacity() -> Result<Option<u8>, String> {
+    let supplies = std::fs::read_dir("/sys/class/power_supply")
+        .map_err(|e| format!("read power supplies: {e}"))?;
+    let mut capacities = Vec::new();
+    for supply in supplies {
+        let supply = supply.map_err(|e| format!("read power supply entry: {e}"))?;
+        let path = supply.path();
+        let Ok(kind) = std::fs::read_to_string(path.join("type")) else {
+            continue;
+        };
+        if kind.trim() != "Battery" {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(path.join("capacity")) else {
+            continue;
+        };
+        if let Ok(value) = raw.trim().parse::<u8>() {
+            if value <= 100 {
+                capacities.push(value);
+            }
+        }
+    }
+    if capacities.is_empty() {
+        Ok(None)
+    } else {
+        let total: u16 = capacities.iter().map(|&v| u16::from(v)).sum();
+        Ok(Some((total / capacities.len() as u16) as u8))
+    }
+}
+
 const DEFAULT_CONFIG: &str = r#"# powerwatch configuration
 # Containers to stop on battery (restarted on AC only if powerwatch stopped them).
 containers = ["prefect-server", "prefect-postgres"]
@@ -99,10 +152,63 @@ notify = true
 # Extra shell commands (run with `sh -c`).
 on_battery_cmds = []
 on_ac_cmds = []
+# Low-battery warning/actions threshold; 0 disables this feature.
+low_battery_threshold = 15
+on_low_battery_cmds = []
 "#;
 
 fn parse_config(s: &str) -> Result<Config, String> {
     toml::from_str(s).map_err(|e| e.to_string())
+}
+
+fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if !is_known_profile(&cfg.battery_profile) {
+        errors.push(format!(
+            "battery_profile must be power-saver, balanced, or performance (got {:?})",
+            cfg.battery_profile
+        ));
+    }
+    if cfg.low_battery_threshold > 100 {
+        errors.push("low_battery_threshold must be between 0 and 100".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for container in &cfg.containers {
+        if container.trim().is_empty() {
+            errors.push("containers must not contain empty names".into());
+        } else if !seen.insert(container) {
+            errors.push(format!("duplicate container name: {container}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn check_config_file() -> Result<bool, String> {
+    let path = config_path();
+    let cfg = match std::fs::read_to_string(&path) {
+        Ok(text) => parse_config(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    validate_config(&cfg)
+        .map_err(|errors| format!("{}:\n{}", path.display(), errors.join("\n")))?;
+    Ok(path.exists())
+}
+
+fn age_label(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86400)
+    }
 }
 
 fn load_config(dry: bool) -> Config {
@@ -134,6 +240,34 @@ fn load_config(dry: bool) -> Config {
     }
 }
 
+#[derive(Default)]
+struct FlapDetector {
+    changes: VecDeque<Instant>,
+    last_alert: Option<Instant>,
+}
+
+impl FlapDetector {
+    fn observe(&mut self, now: Instant) -> bool {
+        while self
+            .changes
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > FLAP_WINDOW)
+        {
+            self.changes.pop_front();
+        }
+        self.changes.push_back(now);
+        let cooled_down = self
+            .last_alert
+            .is_none_or(|at| now.saturating_duration_since(at) >= FLAP_ALERT_COOLDOWN);
+        if self.changes.len() >= FLAP_THRESHOLD && cooled_down {
+            self.last_alert = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Load state. A corrupt file is moved aside (never silently discarded) so the
 /// operator can recover the list of stopped containers from it.
 fn load_state_from(p: &Path, dry: bool) -> State {
@@ -150,7 +284,11 @@ fn load_state_from(p: &Path, dry: bool) -> State {
         Ok(st) => st,
         Err(e) => {
             let bad = p.with_extension("corrupt");
-            err!("corrupt state {}: {e}; keeping a copy at {} and starting fresh", p.display(), bad.display());
+            err!(
+                "corrupt state {}: {e}; keeping a copy at {} and starting fresh",
+                p.display(),
+                bad.display()
+            );
             if !dry {
                 let _ = std::fs::rename(p, &bad);
             }
@@ -167,7 +305,11 @@ fn save_state_to(p: &Path, st: &State) {
         }
         let tmp = p.with_extension("tmp");
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(toml::to_string(st).map_err(std::io::Error::other)?.as_bytes())?;
+        f.write_all(
+            toml::to_string(st)
+                .map_err(std::io::Error::other)?
+                .as_bytes(),
+        )?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, p)
@@ -224,7 +366,11 @@ fn is_known_profile(p: &str) -> bool {
 
 /// Profile to remember for restore. tuned-ppd may report "unknown"; use balanced then.
 fn profile_to_remember(cur: &str) -> String {
-    if is_known_profile(cur) { cur.to_string() } else { "balanced".to_string() }
+    if is_known_profile(cur) {
+        cur.to_string()
+    } else {
+        "balanced".to_string()
+    }
 }
 
 /// Profile to restore on AC (never fails on empty/unknown saved values).
@@ -238,7 +384,8 @@ fn should_set_profile(cur: &str, target: &str, st: &State) -> bool {
     if cur == target {
         return false;
     }
-    let already_ours = st.prev_profile.is_some() && st.on_battery == Some(true) && !is_known_profile(cur);
+    let already_ours =
+        st.prev_profile.is_some() && st.on_battery == Some(true) && !is_known_profile(cur);
     !already_ours
 }
 
@@ -252,6 +399,7 @@ fn is_missing_connection(e: &str) -> bool {
 trait Sys {
     /// Run a command, return trimmed stdout on success or an error string.
     async fn run(&self, prog: &str, args: &[&str]) -> Result<String, String>;
+    fn battery_capacity(&self) -> Result<Option<u8>, String>;
     async fn get_profile(&self) -> Result<String, String>;
     async fn set_profile(&self, p: &str) -> Result<(), String>;
     async fn notify(&self, title: &str, body: &str);
@@ -284,16 +432,30 @@ impl Sys for RealSys {
         }
     }
 
+    fn battery_capacity(&self) -> Result<Option<u8>, String> {
+        read_battery_capacity()
+    }
+
     async fn get_profile(&self) -> Result<String, String> {
-        let conn = zbus::Connection::system().await.map_err(|e| e.to_string())?;
-        let pp = PowerProfilesProxy::new(&conn).await.map_err(|e| e.to_string())?;
+        let conn = zbus::Connection::system()
+            .await
+            .map_err(|e| e.to_string())?;
+        let pp = PowerProfilesProxy::new(&conn)
+            .await
+            .map_err(|e| e.to_string())?;
         pp.active_profile().await.map_err(|e| e.to_string())
     }
 
     async fn set_profile(&self, p: &str) -> Result<(), String> {
-        let conn = zbus::Connection::system().await.map_err(|e| e.to_string())?;
-        let pp = PowerProfilesProxy::new(&conn).await.map_err(|e| e.to_string())?;
-        pp.set_active_profile(p).await.map_err(|e| format!("set profile {p}: {e}"))
+        let conn = zbus::Connection::system()
+            .await
+            .map_err(|e| e.to_string())?;
+        let pp = PowerProfilesProxy::new(&conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        pp.set_active_profile(p)
+            .await
+            .map_err(|e| format!("set profile {p}: {e}"))
     }
 
     async fn notify(&self, title: &str, body: &str) {
@@ -312,7 +474,16 @@ impl Sys for RealSys {
             },
         };
         let hints: std::collections::HashMap<&str, zbus::Variant> = Default::default();
-        let args = ("powerwatch", 0u32, "battery", title, body, Vec::<&str>::new(), hints, 8000i32);
+        let args = (
+            "powerwatch",
+            0u32,
+            "battery",
+            title,
+            body,
+            Vec::<&str>::new(),
+            hints,
+            8000i32,
+        );
         let call = conn.call_method(
             Some("org.freedesktop.Notifications"),
             "/org/freedesktop/Notifications",
@@ -367,8 +538,66 @@ impl<S: Sys> Ctx<S> {
         }
     }
 
+    fn record_transition(&mut self, on_battery: bool) {
+        if self.st.on_battery == Some(on_battery) {
+            return;
+        }
+        let at_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.st.recent_transitions.push(PowerTransition {
+            at_unix_seconds,
+            on_battery,
+        });
+        if self.st.recent_transitions.len() > TRANSITION_HISTORY {
+            self.st.recent_transitions.remove(0);
+        }
+        self.st.on_battery = Some(on_battery);
+        self.persist();
+    }
+
+    async fn check_low_battery(&mut self, on_battery: bool) {
+        if !on_battery {
+            if self.st.low_battery_alerted {
+                self.st.low_battery_alerted = false;
+                self.persist();
+            }
+            return;
+        }
+        let threshold = self.cfg.low_battery_threshold;
+        if threshold == 0 {
+            return;
+        }
+        match self.sys.battery_capacity() {
+            Ok(Some(capacity)) if capacity <= threshold && !self.st.low_battery_alerted => {
+                self.st.low_battery_alerted = true;
+                self.persist();
+                let message = format!("Battery is at {capacity}% (threshold: {threshold}%).");
+                warn!("{message}");
+                let cmds = self.cfg.on_low_battery_cmds.clone();
+                let mut notes = vec![message];
+                self.extra_cmds(&cmds, &mut notes).await;
+                self.notify("Low battery", &notes).await;
+            }
+            Ok(Some(capacity))
+                if capacity >= threshold.saturating_add(LOW_BATTERY_HYSTERESIS)
+                    && self.st.low_battery_alerted =>
+            {
+                self.st.low_battery_alerted = false;
+                self.persist();
+                info!("battery recovered to {capacity}%; low-battery actions re-armed");
+            }
+            Ok(_) => {}
+            Err(e) => warn!("read battery capacity: {e}"),
+        }
+    }
+
     async fn container_running(&self, c: &str) -> Result<bool, String> {
-        self.sys.run("docker", &["inspect", "-f", "{{.State.Running}}", c]).await.map(|r| r == "true")
+        self.sys
+            .run("docker", &["inspect", "-f", "{{.State.Running}}", c])
+            .await
+            .map(|r| r == "true")
     }
 
     async fn on_battery(&mut self) {
@@ -448,7 +677,9 @@ impl<S: Sys> Ctx<S> {
         // Wi-Fi.
         if self.cfg.wifi_powersave {
             match self.wifi_enable().await {
-                Ok(Some(con)) => notes.push(format!("Wi-Fi powersave on ({con}, applies on reconnect)")),
+                Ok(Some(con)) => {
+                    notes.push(format!("Wi-Fi powersave on ({con}, applies on reconnect)"))
+                }
                 Ok(None) => {}
                 Err(e) => warn!("wifi powersave skipped: {e}"),
             }
@@ -460,8 +691,7 @@ impl<S: Sys> Ctx<S> {
         self.notify("On battery", &notes).await;
     }
 
-    async fn on_ac(&mut self) {
-        let mut notes = Vec::new();
+    async fn restore_ac_changes(&mut self, notes: &mut Vec<String>) {
         if let Some(prev) = self.st.prev_profile.clone() {
             let prev = profile_to_restore(&prev);
             if self.dry {
@@ -501,8 +731,13 @@ impl<S: Sys> Ctx<S> {
             Err(e) => warn!("wifi restore: {e}"),
         }
         if self.st.pending() {
-            warn!("not everything could be restored; will retry on next AC event or restart");
+            warn!("not everything could be restored; will retry while AC remains connected");
         }
+    }
+
+    async fn on_ac(&mut self) {
+        let mut notes = Vec::new();
+        self.restore_ac_changes(&mut notes).await;
         let cmds = self.cfg.on_ac_cmds.clone();
         self.extra_cmds(&cmds, &mut notes).await;
         self.st.on_battery = Some(false);
@@ -511,7 +746,20 @@ impl<S: Sys> Ctx<S> {
     }
 
     async fn wifi_power_save_of(&self, con: &str) -> Result<&'static str, String> {
-        let raw = self.sys.run("nmcli", &["-g", "802-11-wireless.powersave", "connection", "show", "id", con]).await?;
+        let raw = self
+            .sys
+            .run(
+                "nmcli",
+                &[
+                    "-g",
+                    "802-11-wireless.powersave",
+                    "connection",
+                    "show",
+                    "id",
+                    con,
+                ],
+            )
+            .await?;
         Ok(parse_powersave(&raw).unwrap_or("0"))
     }
 
@@ -521,7 +769,17 @@ impl<S: Sys> Ctx<S> {
     async fn wifi_enable(&mut self) -> Result<Option<String>, String> {
         let out = self
             .sys
-            .run("nmcli", &["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+            .run(
+                "nmcli",
+                &[
+                    "-t",
+                    "-f",
+                    "NAME,TYPE,DEVICE",
+                    "connection",
+                    "show",
+                    "--active",
+                ],
+            )
             .await?;
         let Some((con, _dev)) = parse_active_wifi(&out) else {
             info!("no active Wi-Fi connection");
@@ -539,7 +797,9 @@ impl<S: Sys> Ctx<S> {
             return Ok(None);
         }
         if self.dry {
-            info!("[dry-run] would run: nmcli connection modify id {con:?} 802-11-wireless.powersave 3");
+            info!(
+                "[dry-run] would run: nmcli connection modify id {con:?} 802-11-wireless.powersave 3"
+            );
             return Ok(Some(con));
         }
         if self.st.wifi_con.as_deref() != Some(con.as_str()) {
@@ -547,7 +807,21 @@ impl<S: Sys> Ctx<S> {
             self.st.wifi_prev = Some(cur.to_string());
             self.persist();
         }
-        if let Err(e) = self.sys.run("nmcli", &["connection", "modify", "id", &con, "802-11-wireless.powersave", "3"]).await {
+        if let Err(e) = self
+            .sys
+            .run(
+                "nmcli",
+                &[
+                    "connection",
+                    "modify",
+                    "id",
+                    &con,
+                    "802-11-wireless.powersave",
+                    "3",
+                ],
+            )
+            .await
+        {
             if self.st.wifi_prev.as_deref() == Some(cur) && cur != "3" {
                 // Nothing was changed.
                 self.st.wifi_con = None;
@@ -562,10 +836,19 @@ impl<S: Sys> Ctx<S> {
 
     /// Restore the powersave value we changed, unless someone else has changed it since.
     async fn wifi_restore(&mut self) -> Result<Option<String>, String> {
-        let Some(con) = self.st.wifi_con.clone() else { return Ok(None) };
-        let value = self.st.wifi_prev.as_deref().and_then(parse_powersave).unwrap_or("0");
+        let Some(con) = self.st.wifi_con.clone() else {
+            return Ok(None);
+        };
+        let value = self
+            .st
+            .wifi_prev
+            .as_deref()
+            .and_then(parse_powersave)
+            .unwrap_or("0");
         if self.dry {
-            info!("[dry-run] would run: nmcli connection modify id {con:?} 802-11-wireless.powersave {value}");
+            info!(
+                "[dry-run] would run: nmcli connection modify id {con:?} 802-11-wireless.powersave {value}"
+            );
             return Ok(Some(con));
         }
         let changed = match self.wifi_power_save_of(&con).await {
@@ -581,7 +864,19 @@ impl<S: Sys> Ctx<S> {
             Err(e) => return Err(e),
         };
         if changed {
-            self.sys.run("nmcli", &["connection", "modify", "id", &con, "802-11-wireless.powersave", value]).await?;
+            self.sys
+                .run(
+                    "nmcli",
+                    &[
+                        "connection",
+                        "modify",
+                        "id",
+                        &con,
+                        "802-11-wireless.powersave",
+                        value,
+                    ],
+                )
+                .await?;
             info!("wifi powersave {value} restored on {con}");
         }
         self.st.wifi_con = None;
@@ -596,19 +891,27 @@ impl<S: Sys> Ctx<S> {
         }
         let body = notes.join("\n");
         if self.dry {
-            info!("[dry-run] would notify: {title}: {}", body.replace('\n', "; "));
+            info!(
+                "[dry-run] would notify: {title}: {}",
+                body.replace('\n', "; ")
+            );
             return;
         }
         self.sys.notify(title, &body).await;
     }
 
     async fn apply(&mut self, on_battery: bool) {
-        info!("applying state: {}", if on_battery { "battery" } else { "AC" });
+        info!(
+            "applying state: {}",
+            if on_battery { "battery" } else { "AC" }
+        );
+        self.record_transition(on_battery);
         if on_battery {
             self.on_battery().await
         } else {
             self.on_ac().await
         }
+        self.check_low_battery(on_battery).await;
     }
 }
 
@@ -640,9 +943,77 @@ trait PowerProfiles {
 async fn connect() -> zbus::Result<(UPowerProxy<'static>, UPowerProxy<'static>)> {
     let conn = zbus::Connection::system().await?;
     let p = UPowerProxy::new(&conn).await?;
-    let poll = UPowerProxy::builder(&conn).cache_properties(zbus::proxy::CacheProperties::No).build().await?;
+    let poll = UPowerProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
     poll.on_battery().await?;
     Ok((p, poll))
+}
+
+async fn print_status() -> Result<(), String> {
+    let (proxy, _) = connect()
+        .await
+        .map_err(|e| format!("cannot reach UPower: {e}"))?;
+    let on_battery = proxy
+        .on_battery()
+        .await
+        .map_err(|e| format!("read UPower state: {e}"))?;
+    let profile = RealSys {
+        session: Mutex::new(None),
+    }
+    .get_profile()
+    .await
+    .map_err(|e| format!("read power profile: {e}"))?;
+    let state = load_state_from(&state_path(), true);
+    println!(
+        "Power state: {}",
+        if on_battery {
+            "on battery"
+        } else {
+            "AC connected"
+        }
+    );
+    match read_battery_capacity() {
+        Ok(Some(capacity)) => println!("Battery: {capacity}%"),
+        Ok(None) => println!("Battery: unavailable"),
+        Err(e) => println!("Battery: unavailable ({e})"),
+    }
+    println!("Power profile: {profile}");
+    println!(
+        "Pending restores: {}",
+        if state.pending() { "yes" } else { "no" }
+    );
+    if let Some(profile) = &state.prev_profile {
+        println!("  profile: {profile}");
+    }
+    if !state.stopped.is_empty() {
+        println!("  containers: {}", state.stopped.join(", "));
+    }
+    if let Some(connection) = &state.wifi_con {
+        println!("  Wi-Fi connection: {connection}");
+    }
+    println!("Recent stable power changes:");
+    if state.recent_transitions.is_empty() {
+        println!("  none recorded");
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for transition in state.recent_transitions.iter().rev() {
+            println!(
+                "  {}: {}",
+                age_label(now.saturating_sub(transition.at_unix_seconds)),
+                if transition.on_battery {
+                    "on battery"
+                } else {
+                    "AC connected"
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 const POLL: Duration = Duration::from_secs(60);
@@ -652,24 +1023,68 @@ const MAX_POLL_FAILURES: u32 = 3;
 async fn main() {
     let mut dry = false;
     let mut once = false;
+    let mut status = false;
+    let mut check_config = false;
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--dry-run" => dry = true,
             "--once" => once = true,
+            "status" | "--status" => status = true,
+            "check-config" | "--check-config" => check_config = true,
             "-h" | "--help" => {
-                println!("usage: powerwatch [--dry-run] [--once]");
+                println!(
+                    "usage: powerwatch [--dry-run] [--once] | powerwatch status | powerwatch check-config"
+                );
                 return;
             }
             o => {
-                eprintln!("unknown argument: {o}\nusage: powerwatch [--dry-run] [--once]");
+                eprintln!(
+                    "unknown argument: {o}\nusage: powerwatch [--dry-run] [--once] | powerwatch status | powerwatch check-config"
+                );
                 std::process::exit(2);
             }
         }
     }
+    if (status && check_config) || ((status || check_config) && (dry || once)) {
+        eprintln!("status/check-config cannot be combined with --dry-run or --once");
+        std::process::exit(2);
+    }
+    if status {
+        if let Err(e) = print_status().await {
+            eprintln!("powerwatch status: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if check_config {
+        match check_config_file() {
+            Ok(true) => println!("{}: configuration is valid", config_path().display()),
+            Ok(false) => println!("no config found; defaults are valid"),
+            Err(e) => {
+                eprintln!("powerwatch check-config: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let cfg = load_config(dry);
+    if let Err(errors) = validate_config(&cfg) {
+        for error in errors {
+            err!("invalid configuration: {error}");
+        }
+        std::process::exit(2);
+    }
     let state_file = state_path();
     let st = load_state_from(&state_file, dry);
-    let mut ctx = Ctx { sys: RealSys { session: Mutex::new(None) }, cfg, dry, st, state_file };
+    let mut ctx = Ctx {
+        sys: RealSys {
+            session: Mutex::new(None),
+        },
+        cfg,
+        dry,
+        st,
+        state_file,
+    };
     if dry {
         info!("dry-run: no changes will be made");
     }
@@ -711,6 +1126,10 @@ async fn main() {
     let mut poll = tokio::time::interval(POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.tick().await;
+    let mut restore_retry = tokio::time::interval(RESTORE_RETRY);
+    restore_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    restore_retry.tick().await;
+    let mut flap_detector = FlapDetector::default();
     let mut poll_failures = 0u32;
     loop {
         let sleep = async {
@@ -724,9 +1143,16 @@ async fn main() {
                 match ch {
                     Some(c) => {
                         if let Ok(v) = c.get().await {
-                            cur = v;
-                            info!("OnBattery changed -> {v}; debouncing {}s", DEBOUNCE.as_secs());
-                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                            if v != cur {
+                                cur = v;
+                                info!("OnBattery changed -> {v}; debouncing {}s", DEBOUNCE.as_secs());
+                                deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                                if flap_detector.observe(Instant::now()) {
+                                    let notes = vec!["The AC/battery status has changed repeatedly. Check the charger, cable, and USB-C port.".into()];
+                                    warn!("power source is flapping; notification throttled for {} minutes", FLAP_ALERT_COOLDOWN.as_secs() / 60);
+                                    ctx.notify("Unstable charging connection", &notes).await;
+                                }
+                            }
                         }
                     }
                     None => {
@@ -744,6 +1170,11 @@ async fn main() {
                             info!("poll: OnBattery = {v}; debouncing {}s", DEBOUNCE.as_secs());
                             cur = v;
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                            if flap_detector.observe(Instant::now()) {
+                                let notes = vec!["The AC/battery status has changed repeatedly. Check the charger, cable, and USB-C port.".into()];
+                                warn!("power source is flapping; notification throttled for {} minutes", FLAP_ALERT_COOLDOWN.as_secs() / 60);
+                                ctx.notify("Unstable charging connection", &notes).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -752,6 +1183,21 @@ async fn main() {
                         if poll_failures >= MAX_POLL_FAILURES {
                             err!("UPower unreachable; exiting for restart");
                             std::process::exit(1);
+                        }
+                    }
+                }
+                if deadline.is_none() {
+                    ctx.check_low_battery(cur).await;
+                }
+            }
+            _ = restore_retry.tick() => {
+                if !cur && !applied && deadline.is_none() && ctx.st.pending() {
+                    let mut notes = Vec::new();
+                    ctx.restore_ac_changes(&mut notes).await;
+                    if !notes.is_empty() {
+                        info!("AC restoration retry progress: {}", notes.join("; "));
+                        if !ctx.st.pending() {
+                            ctx.notify("Restored on AC", &notes).await;
                         }
                     }
                 }
@@ -779,7 +1225,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
     /// Scripted fake: commands are matched by their space-joined text; unmatched => Ok("").
@@ -788,13 +1234,16 @@ mod tests {
         calls: RefCell<Vec<String>>,
         replies: RefCell<HashMap<String, Result<String, String>>>,
         profile: RefCell<String>,
+        battery: Cell<Option<u8>>,
         set_profile_fails: bool,
         notes: RefCell<Vec<(String, String)>>,
     }
 
     impl Fake {
         fn reply(&self, cmd: &str, r: Result<&str, &str>) {
-            self.replies.borrow_mut().insert(cmd.into(), r.map(Into::into).map_err(Into::into));
+            self.replies
+                .borrow_mut()
+                .insert(cmd.into(), r.map(Into::into).map_err(Into::into));
         }
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
@@ -808,14 +1257,25 @@ mod tests {
         async fn run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
             let key = format!("{prog} {}", args.join(" "));
             self.calls.borrow_mut().push(key.clone());
-            self.replies.borrow().get(&key).cloned().unwrap_or(Ok(String::new()))
+            self.replies
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or(Ok(String::new()))
+        }
+        fn battery_capacity(&self) -> Result<Option<u8>, String> {
+            Ok(self.battery.get())
         }
         async fn get_profile(&self) -> Result<String, String> {
             Ok(self.profile.borrow().clone())
         }
         async fn set_profile(&self, p: &str) -> Result<(), String> {
             self.calls.borrow_mut().push(format!("set_profile {p}"));
-            if self.set_profile_fails { Err("boom".into()) } else { Ok(()) }
+            if self.set_profile_fails {
+                Err("boom".into())
+            } else {
+                Ok(())
+            }
         }
         async fn notify(&self, t: &str, b: &str) {
             self.notes.borrow_mut().push((t.into(), b.into()));
@@ -835,11 +1295,20 @@ mod tests {
     }
 
     fn ctx<'a>(f: &'a Fake, tag: &str, st: State) -> Ctx<&'a Fake> {
-        Ctx { sys: f, cfg: Config::default(), dry: false, st, state_file: tmpfile(tag) }
+        Ctx {
+            sys: f,
+            cfg: Config::default(),
+            dry: false,
+            st,
+            state_file: tmpfile(tag),
+        }
     }
 
     fn running(f: &Fake, c: &str, v: bool) {
-        f.reply(&format!("docker inspect -f {{{{.State.Running}}}} {c}"), Ok(if v { "true" } else { "false" }));
+        f.reply(
+            &format!("docker inspect -f {{{{.State.Running}}}} {c}"),
+            Ok(if v { "true" } else { "false" }),
+        );
     }
 
     // ----- pure -----
@@ -861,19 +1330,69 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_catches_invalid_values() {
+        assert!(validate_config(&Config::default()).is_ok());
+        let cfg = parse_config(
+            r#"battery_profile = "turbo"
+low_battery_threshold = 101
+containers = ["db", "db", ""]"#,
+        )
+        .unwrap();
+        let errors = validate_config(&cfg).unwrap_err();
+        assert_eq!(errors.len(), 4);
+    }
+
+    #[test]
+    fn flap_detector_requires_repeated_changes_and_throttles() {
+        let mut detector = FlapDetector::default();
+        let start = Instant::now();
+        for i in 0..FLAP_THRESHOLD - 1 {
+            assert!(!detector.observe(start + Duration::from_secs(i as u64)));
+        }
+        assert!(detector.observe(start + Duration::from_secs(3)));
+        assert!(!detector.observe(start + Duration::from_secs(4)));
+
+        let later = start + FLAP_ALERT_COOLDOWN;
+        for i in 0..FLAP_THRESHOLD - 1 {
+            assert!(!detector.observe(later + Duration::from_secs(i as u64)));
+        }
+        assert!(detector.observe(later + Duration::from_secs(3)));
+    }
+
+    #[test]
     fn terse_split_and_wifi_parse() {
         assert_eq!(split_terse(r"a\:b:c\\d:e"), vec!["a:b", r"c\d", "e"]);
-        assert_eq!(parse_active_wifi(WIFI_LIST), Some(("eduroam 1".into(), "wlp4s0".into())));
-        assert_eq!(parse_active_wifi(r"my\:net:802-11-wireless:wlan0"), Some(("my:net".into(), "wlan0".into())));
-        assert_eq!(parse_active_wifi("lo:loopback:lo\ndocker0:bridge:docker0"), None);
+        assert_eq!(
+            parse_active_wifi(WIFI_LIST),
+            Some(("eduroam 1".into(), "wlp4s0".into()))
+        );
+        assert_eq!(
+            parse_active_wifi(r"my\:net:802-11-wireless:wlan0"),
+            Some(("my:net".into(), "wlan0".into()))
+        );
+        assert_eq!(
+            parse_active_wifi("lo:loopback:lo\ndocker0:bridge:docker0"),
+            None
+        );
         assert_eq!(parse_active_wifi(""), None);
         // Wi-Fi with no device (inactive-looking) still has 3 fields; malformed lines are skipped.
-        assert_eq!(parse_active_wifi("junk\nx:802-11-wireless:d"), Some(("x".into(), "d".into())));
+        assert_eq!(
+            parse_active_wifi("junk\nx:802-11-wireless:d"),
+            Some(("x".into(), "d".into()))
+        );
     }
 
     #[test]
     fn powersave_values() {
-        for (i, o) in [("enable", "3"), ("3", "3"), ("default", "0"), ("0 (default)", "0"), ("ignore", "1"), ("disable", "2"), (" enable\n", "3")] {
+        for (i, o) in [
+            ("enable", "3"),
+            ("3", "3"),
+            ("default", "0"),
+            ("0 (default)", "0"),
+            ("ignore", "1"),
+            ("disable", "2"),
+            (" enable\n", "3"),
+        ] {
             assert_eq!(parse_powersave(i), Some(o), "{i}");
         }
         assert_eq!(parse_powersave("wat"), None);
@@ -891,7 +1410,11 @@ mod tests {
         assert!(should_set_profile("balanced", "power-saver", &fresh));
         assert!(should_set_profile("unknown", "power-saver", &fresh));
         assert!(!should_set_profile("power-saver", "power-saver", &fresh));
-        let done = State { on_battery: Some(true), prev_profile: Some("balanced".into()), ..Default::default() };
+        let done = State {
+            on_battery: Some(true),
+            prev_profile: Some("balanced".into()),
+            ..Default::default()
+        };
         assert!(!should_set_profile("unknown", "power-saver", &done));
         assert!(should_set_profile("balanced", "power-saver", &done)); // user changed it
     }
@@ -912,6 +1435,7 @@ mod tests {
             stopped: vec!["a".into(), "b".into()],
             wifi_con: Some("eduroam 1".into()),
             wifi_prev: Some("default".into()),
+            ..Default::default()
         };
         save_state_to(&p, &st);
         assert!(!p.with_extension("tmp").exists());
@@ -922,7 +1446,10 @@ mod tests {
         std::fs::write(&p, "stopped = [[[ nope").unwrap();
         assert_eq!(load_state_from(&p, false), State::default());
         assert!(!p.exists());
-        assert_eq!(std::fs::read_to_string(p.with_extension("corrupt")).unwrap(), "stopped = [[[ nope");
+        assert_eq!(
+            std::fs::read_to_string(p.with_extension("corrupt")).unwrap(),
+            "stopped = [[[ nope"
+        );
     }
 
     #[test]
@@ -960,7 +1487,10 @@ mod tests {
         assert_eq!(c.st.wifi_prev.as_deref(), Some("0"));
         assert!(f.has("set_profile power-saver"));
         assert!(f.has(MOD3));
-        assert!(!f.calls().iter().any(|x| x.contains("reapply")), "must not touch the live link");
+        assert!(
+            !f.calls().iter().any(|x| x.contains("reapply")),
+            "must not touch the live link"
+        );
         // persisted
         assert_eq!(load_state_from(&c.state_file, false), c.st);
 
@@ -970,8 +1500,18 @@ mod tests {
         c.apply(false).await;
         let calls = f.calls();
         assert_eq!(calls[0], "set_profile balanced");
-        let starts: Vec<_> = calls.iter().filter(|x| x.starts_with("docker start")).cloned().collect();
-        assert_eq!(starts, vec!["docker start prefect-postgres", "docker start prefect-server"]);
+        let starts: Vec<_> = calls
+            .iter()
+            .filter(|x| x.starts_with("docker start"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                "docker start prefect-postgres",
+                "docker start prefect-server"
+            ]
+        );
         assert!(f.has("nmcli connection modify id eduroam 1 802-11-wireless.powersave 0"));
         assert!(!c.st.pending());
         assert_eq!(c.st.on_battery, Some(false));
@@ -993,13 +1533,25 @@ mod tests {
             stopped: vec!["prefect-server".into(), "prefect-postgres".into()],
             wifi_con: Some("eduroam 1".into()),
             wifi_prev: Some("default".into()),
+            ..Default::default()
         };
         let mut c = ctx(&f, "restart", prior.clone());
         c.apply(true).await;
-        assert_eq!(c.st, prior, "state (incl. original wifi value) must be preserved");
+        assert_eq!(
+            c.st, prior,
+            "state (incl. original wifi value) must be preserved"
+        );
         let calls = f.calls();
-        assert!(!calls.iter().any(|x| x.starts_with("set_profile")), "{calls:?}");
-        assert!(!calls.iter().any(|x| x.contains("docker stop") || x.contains("docker start")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|x| x.starts_with("set_profile")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|x| x.contains("docker stop") || x.contains("docker start")),
+            "{calls:?}"
+        );
         assert!(!calls.iter().any(|x| x.contains("modify")), "{calls:?}");
         assert!(f.notes.borrow().is_empty(), "no noise when nothing changed");
     }
@@ -1015,14 +1567,21 @@ mod tests {
         let mut c = ctx(&f, "untouched", State::default());
         c.apply(true).await;
         assert!(!c.st.pending(), "{:?}", c.st);
-        assert!(!f.calls().iter().any(|x| x.starts_with("set_profile") || x.contains("modify") || x.contains("docker stop")));
+        assert!(!f.calls().iter().any(|x| x.starts_with("set_profile")
+            || x.contains("modify")
+            || x.contains("docker stop")));
         c.apply(false).await;
-        assert!(!f.calls().iter().any(|x| x.starts_with("set_profile") || x.contains("modify") || x.contains("docker start")));
+        assert!(!f.calls().iter().any(|x| x.starts_with("set_profile")
+            || x.contains("modify")
+            || x.contains("docker start")));
     }
 
     #[tokio::test]
     async fn failed_profile_set_leaves_nothing_to_restore() {
-        let f = Fake { set_profile_fails: true, ..Default::default() };
+        let f = Fake {
+            set_profile_fails: true,
+            ..Default::default()
+        };
         *f.profile.borrow_mut() = "balanced".into();
         let mut c = ctx(&f, "pfail", State::default());
         c.cfg.containers.clear();
@@ -1048,19 +1607,33 @@ mod tests {
     async fn failed_docker_start_stays_tracked() {
         let f = Fake::default();
         f.reply("docker start b", Err("no daemon"));
-        let st = State { stopped: vec!["a".into(), "b".into()], on_battery: Some(true), ..Default::default() };
+        let st = State {
+            stopped: vec!["a".into(), "b".into()],
+            on_battery: Some(true),
+            ..Default::default()
+        };
         let mut c = ctx(&f, "dstart", st);
         c.apply(false).await;
         assert_eq!(c.st.stopped, vec!["b"]);
         // order: reverse of stop order
-        assert_eq!(f.calls().iter().filter(|x| x.starts_with("docker start")).cloned().collect::<Vec<_>>(), vec!["docker start b", "docker start a"]);
+        assert_eq!(
+            f.calls()
+                .iter()
+                .filter(|x| x.starts_with("docker start"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["docker start b", "docker start a"]
+        );
     }
 
     #[tokio::test]
     async fn ac_restore_unknown_or_empty_prev_uses_balanced() {
         for prev in ["unknown", ""] {
             let f = Fake::default();
-            let st = State { prev_profile: Some(prev.into()), ..Default::default() };
+            let st = State {
+                prev_profile: Some(prev.into()),
+                ..Default::default()
+            };
             let mut c = ctx(&f, "unk", st);
             c.apply(false).await;
             assert!(f.has("set_profile balanced"), "{prev}");
@@ -1070,11 +1643,86 @@ mod tests {
 
     #[tokio::test]
     async fn ac_profile_restore_failure_is_retained() {
-        let f = Fake { set_profile_fails: true, ..Default::default() };
-        let st = State { prev_profile: Some("balanced".into()), ..Default::default() };
+        let f = Fake {
+            set_profile_fails: true,
+            ..Default::default()
+        };
+        let st = State {
+            prev_profile: Some("balanced".into()),
+            ..Default::default()
+        };
         let mut c = ctx(&f, "pretain", st);
         c.apply(false).await;
         assert_eq!(c.st.prev_profile.as_deref(), Some("balanced"));
+    }
+
+    #[tokio::test]
+    async fn pending_ac_restore_can_retry_without_rerunning_hooks() {
+        let f = Fake::default();
+        f.reply("docker start x", Err("no daemon"));
+        let st = State {
+            stopped: vec!["x".into()],
+            on_battery: Some(true),
+            ..Default::default()
+        };
+        let mut c = ctx(&f, "retry", st);
+        c.cfg.containers.clear();
+        c.cfg.wifi_powersave = false;
+        c.cfg.on_ac_cmds = vec!["echo ac".into()];
+        c.apply(false).await;
+        assert!(c.st.pending());
+        assert_eq!(
+            f.calls()
+                .iter()
+                .filter(|x| x.as_str() == "sh -c echo ac")
+                .count(),
+            1
+        );
+
+        f.reply("docker start x", Ok(""));
+        c.restore_ac_changes(&mut Vec::new()).await;
+        assert!(!c.st.pending());
+        assert_eq!(
+            f.calls()
+                .iter()
+                .filter(|x| x.as_str() == "sh -c echo ac")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn low_battery_action_fires_once_and_rearms_after_recovery() {
+        let f = Fake::default();
+        f.battery.set(Some(10));
+        let mut c = ctx(&f, "low-battery", State::default());
+        c.cfg.on_low_battery_cmds = vec!["echo low".into()];
+        c.check_low_battery(true).await;
+        c.check_low_battery(true).await;
+        assert!(c.st.low_battery_alerted);
+        assert_eq!(
+            f.calls()
+                .iter()
+                .filter(|x| x.as_str() == "sh -c echo low")
+                .count(),
+            1
+        );
+        assert_eq!(f.notes.borrow().len(), 1);
+
+        f.battery.set(Some(20));
+        c.check_low_battery(true).await;
+        assert!(!c.st.low_battery_alerted);
+        f.battery.set(Some(10));
+        c.check_low_battery(true).await;
+        assert_eq!(
+            f.calls()
+                .iter()
+                .filter(|x| x.as_str() == "sh -c echo low")
+                .count(),
+            2
+        );
+        c.check_low_battery(false).await;
+        assert!(!c.st.low_battery_alerted);
     }
 
     #[tokio::test]
@@ -1091,7 +1739,11 @@ mod tests {
     async fn wifi_restore_skips_value_changed_by_user_and_missing_connections() {
         let f = Fake::default();
         f.reply(PS, Ok("disable"));
-        let st = State { wifi_con: Some("eduroam 1".into()), wifi_prev: Some("default".into()), ..Default::default() };
+        let st = State {
+            wifi_con: Some("eduroam 1".into()),
+            wifi_prev: Some("default".into()),
+            ..Default::default()
+        };
         let mut c = ctx(&f, "wuser", st);
         assert_eq!(c.wifi_restore().await.unwrap(), None);
         assert!(!f.calls().iter().any(|x| x.contains("modify")));
@@ -1099,7 +1751,11 @@ mod tests {
 
         let f = Fake::default();
         f.reply(PS, Err("Error: unknown connection 'eduroam 1'."));
-        let st = State { wifi_con: Some("eduroam 1".into()), wifi_prev: Some("default".into()), ..Default::default() };
+        let st = State {
+            wifi_con: Some("eduroam 1".into()),
+            wifi_prev: Some("default".into()),
+            ..Default::default()
+        };
         let mut c = ctx(&f, "wgone", st);
         assert_eq!(c.wifi_restore().await.unwrap(), None);
         assert!(!c.st.pending());
@@ -1107,7 +1763,11 @@ mod tests {
         // Transient failure keeps the record for a later retry.
         let f = Fake::default();
         f.reply(PS, Err("nmcli timed out"));
-        let st = State { wifi_con: Some("eduroam 1".into()), wifi_prev: Some("default".into()), ..Default::default() };
+        let st = State {
+            wifi_con: Some("eduroam 1".into()),
+            wifi_prev: Some("default".into()),
+            ..Default::default()
+        };
         let mut c = ctx(&f, "wtrans", st);
         assert!(c.wifi_restore().await.is_err());
         assert!(c.st.wifi_con.is_some());
@@ -1117,9 +1777,19 @@ mod tests {
     async fn wifi_roaming_restores_previous_connection_first() {
         let f = Fake::default();
         f.reply(LIST, Ok("other:802-11-wireless:wlp4s0"));
-        f.reply("nmcli -g 802-11-wireless.powersave connection show id other", Ok("default"));
-        let st = State { wifi_con: Some("old".into()), wifi_prev: Some("2".into()), ..Default::default() };
-        f.reply("nmcli -g 802-11-wireless.powersave connection show id old", Ok("enable"));
+        f.reply(
+            "nmcli -g 802-11-wireless.powersave connection show id other",
+            Ok("default"),
+        );
+        let st = State {
+            wifi_con: Some("old".into()),
+            wifi_prev: Some("2".into()),
+            ..Default::default()
+        };
+        f.reply(
+            "nmcli -g 802-11-wireless.powersave connection show id old",
+            Ok("enable"),
+        );
         let mut c = ctx(&f, "roam", st);
         c.wifi_enable().await.unwrap();
         assert!(f.has("nmcli connection modify id old 802-11-wireless.powersave 2"));
@@ -1149,7 +1819,12 @@ mod tests {
         let bad: Vec<_> = f
             .calls()
             .into_iter()
-            .filter(|x| x.starts_with("set_profile") || x.contains("modify") || x.contains("docker stop") || x.starts_with("sh"))
+            .filter(|x| {
+                x.starts_with("set_profile")
+                    || x.contains("modify")
+                    || x.contains("docker stop")
+                    || x.starts_with("sh")
+            })
             .collect();
         assert!(bad.is_empty(), "{bad:?}");
         assert!(!c.st.pending());
@@ -1181,7 +1856,12 @@ mod tests {
         let f = Fake::default();
         *f.profile.borrow_mut() = "balanced".into();
         let mut c = ctx(&f, "nonotify", State::default());
-        c.cfg = Config { notify: false, containers: vec![], wifi_powersave: false, ..Config::default() };
+        c.cfg = Config {
+            notify: false,
+            containers: vec![],
+            wifi_powersave: false,
+            ..Config::default()
+        };
         c.apply(true).await;
         assert!(f.notes.borrow().is_empty());
     }
