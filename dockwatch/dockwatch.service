@@ -1,0 +1,12 @@
+[Unit]
+Description=Dock and external display hotplug monitor
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dockwatch watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -27,6 +27,7 @@ install: build
 	install -m755 target/release/audiopop-fix $(BIN_DIR)/audiopop-fix
 	install -m644 powerwatch/powerwatch.service $(SYSTEMD_USER_DIR)/powerwatch.service
 	install -m644 resumecheck/resumecheck.service $(SYSTEMD_USER_DIR)/resumecheck.service
+	install -m644 dockwatch/dockwatch.service $(SYSTEMD_USER_DIR)/dockwatch.service
 	systemctl --user daemon-reload || true
 	@echo "Installed binaries to $(BIN_DIR) and service units to $(SYSTEMD_USER_DIR) - all 6 tools active"
 
