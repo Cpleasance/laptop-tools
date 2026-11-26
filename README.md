@@ -1,8 +1,6 @@
-# laptop-tools
+# ThinkPad PowerWatch 🔋 — Rust Daemons for Linux Battery Scaling (EPP) & Sleep Recovery
 
-# laptop-tools
-
-A unified suite of high-performance Rust daemons and CLI tools for Linux laptops (designed on Lenovo ThinkPad X1 Carbon with Fedora, GNOME, systemd, and UPower, but portable across all modern Linux laptops).
+A unified suite of high-performance, unprivileged Rust daemons for Linux laptops (engineered for Lenovo ThinkPad running Fedora/GNOME/systemd, but portable across all modern Linux distributions). Fixes aggressive 400 MHz EPP throttling on battery unplug, sleep resume driver drops, and Li-ion charging cycle wear.
 
 All tools run unprivileged in user space, support `--json` for integration with desktop status bars (Waybar, Polybar, GNOME Shell extensions), and honor the standard `NO_COLOR` specification.
 
