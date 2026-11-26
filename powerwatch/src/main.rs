@@ -40,19 +40,25 @@ struct Config {
     on_ac_cmds: Vec<String>,
     low_battery_threshold: u8,
     on_low_battery_cmds: Vec<String>,
+    power_budget_watts: f64,
+    heavy_containers: Vec<String>,
+    on_high_power_cmds: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             containers: vec!["prefect-server".into(), "prefect-postgres".into()],
-            battery_profile: "power-saver".into(),
-            wifi_powersave: true,
+            battery_profile: "balanced".into(),
+            wifi_powersave: false,
             notify: true,
             on_battery_cmds: vec![],
             on_ac_cmds: vec![],
             low_battery_threshold: 15,
             on_low_battery_cmds: vec![],
+            power_budget_watts: 0.0,
+            heavy_containers: vec![],
+            on_high_power_cmds: vec![],
         }
     }
 }
@@ -79,12 +85,19 @@ struct State {
     low_battery_alerted: bool,
     /// Last stable power transitions, for `powerwatch status`.
     recent_transitions: Vec<PowerTransition>,
+    /// Whether high power draw shedding is currently active.
+    high_power_shed: bool,
+    /// Heavy containers stopped due to exceeding power budget.
+    heavy_stopped: Vec<String>,
 }
 
 impl State {
     /// True if there is something we changed that still needs restoring.
     fn pending(&self) -> bool {
-        self.prev_profile.is_some() || !self.stopped.is_empty() || self.wifi_con.is_some()
+        self.prev_profile.is_some()
+            || !self.stopped.is_empty()
+            || self.wifi_con.is_some()
+            || !self.heavy_stopped.is_empty()
     }
 }
 
@@ -109,12 +122,26 @@ fn state_path() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("powerwatch/state.toml")
 }
 
-fn read_battery_capacity() -> Result<Option<u8>, String> {
-    let supplies = std::fs::read_dir("/sys/class/power_supply")
-        .map_err(|e| format!("read power supplies: {e}"))?;
-    let mut capacities = Vec::new();
-    for supply in supplies {
-        let supply = supply.map_err(|e| format!("read power supply entry: {e}"))?;
+#[derive(Default, Debug, Clone, PartialEq)]
+struct BatteryMetrics {
+    capacity: Option<u8>,
+    status: Option<String>,
+    power_watts: Option<f64>,
+    energy_now_wh: Option<f64>,
+    energy_full_wh: Option<f64>,
+    energy_full_design_wh: Option<f64>,
+    cycle_count: Option<u32>,
+    threshold_start: Option<u8>,
+    threshold_stop: Option<u8>,
+}
+
+fn read_battery_metrics() -> BatteryMetrics {
+    let mut m = BatteryMetrics::default();
+    let supplies = match std::fs::read_dir("/sys/class/power_supply") {
+        Ok(s) => s,
+        Err(_) => return m,
+    };
+    for supply in supplies.flatten() {
         let path = supply.path();
         let Ok(kind) = std::fs::read_to_string(path.join("type")) else {
             continue;
@@ -122,20 +149,139 @@ fn read_battery_capacity() -> Result<Option<u8>, String> {
         if kind.trim() != "Battery" {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(path.join("capacity")) else {
-            continue;
-        };
-        if let Ok(value) = raw.trim().parse::<u8>() {
-            if value <= 100 {
-                capacities.push(value);
-            }
+
+        if let Ok(s) = std::fs::read_to_string(path.join("capacity"))
+            && let Ok(v) = s.trim().parse::<u8>()
+            && v <= 100
+        {
+            m.capacity = Some(v);
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("status")) {
+            m.status = Some(s.trim().to_string());
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("power_now"))
+            && let Ok(uw) = s.trim().parse::<f64>()
+        {
+            m.power_watts = Some(uw / 1_000_000.0);
+        } else if let (Ok(curr), Ok(volt)) = (
+            std::fs::read_to_string(path.join("current_now")),
+            std::fs::read_to_string(path.join("voltage_now")),
+        ) && let (Ok(ua), Ok(uv)) =
+            (curr.trim().parse::<f64>(), volt.trim().parse::<f64>())
+        {
+            m.power_watts = Some((ua * uv) / 1_000_000_000_000.0);
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("energy_now"))
+            && let Ok(uwh) = s.trim().parse::<f64>()
+        {
+            m.energy_now_wh = Some(uwh / 1_000_000.0);
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("energy_full"))
+            && let Ok(uwh) = s.trim().parse::<f64>()
+        {
+            m.energy_full_wh = Some(uwh / 1_000_000.0);
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("energy_full_design"))
+            && let Ok(uwh) = s.trim().parse::<f64>()
+        {
+            m.energy_full_design_wh = Some(uwh / 1_000_000.0);
+        }
+        if let Ok(s) = std::fs::read_to_string(path.join("cycle_count"))
+            && let Ok(c) = s.trim().parse::<u32>()
+        {
+            m.cycle_count = Some(c);
+        }
+        let start_th = std::fs::read_to_string(path.join("charge_control_start_threshold"))
+            .or_else(|_| std::fs::read_to_string(path.join("charge_start_threshold")));
+        if let Ok(s) = start_th
+            && let Ok(v) = s.trim().parse::<u8>()
+        {
+            m.threshold_start = Some(v);
+        }
+        let stop_th = std::fs::read_to_string(path.join("charge_control_end_threshold"))
+            .or_else(|_| std::fs::read_to_string(path.join("charge_stop_threshold")));
+        if let Ok(s) = stop_th
+            && let Ok(v) = s.trim().parse::<u8>()
+        {
+            m.threshold_stop = Some(v);
+        }
+        break;
+    }
+    m
+}
+
+fn read_battery_capacity() -> Result<Option<u8>, String> {
+    Ok(read_battery_metrics().capacity)
+}
+
+fn read_cpu_power_status() -> Option<String> {
+    let cpufreq = Path::new("/sys/devices/system/cpu/cpu0/cpufreq");
+    if !cpufreq.exists() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Ok(gov) = std::fs::read_to_string(cpufreq.join("scaling_governor")) {
+        let gov = gov.trim();
+        if !gov.is_empty() {
+            parts.push(format!("governor: {gov}"));
         }
     }
-    if capacities.is_empty() {
-        Ok(None)
+    if let Ok(epp) = std::fs::read_to_string(cpufreq.join("energy_performance_preference")) {
+        let epp = epp.trim();
+        if !epp.is_empty() {
+            parts.push(format!("EPP: {epp}"));
+        }
+    }
+    if let Ok(raw_freq) = std::fs::read_to_string(cpufreq.join("scaling_cur_freq"))
+        && let Ok(khz) = raw_freq.trim().parse::<u64>()
+    {
+        parts.push(format!("freq: {} MHz", khz / 1000));
+    }
+    if parts.is_empty() {
+        None
     } else {
-        let total: u16 = capacities.iter().map(|&v| u16::from(v)).sum();
-        Ok(Some((total / capacities.len() as u16) as u8))
+        Some(parts.join(", "))
+    }
+}
+
+fn read_rapl_power_limits() -> Option<(f64, Option<f64>)> {
+    let rapl = Path::new("/sys/class/powercap/intel-rapl:0");
+    if !rapl.exists() {
+        return None;
+    }
+    let pl1 = std::fs::read_to_string(rapl.join("constraint_0_power_limit_uw"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|uw| uw / 1_000_000.0)?;
+    let pl2 = std::fs::read_to_string(rapl.join("constraint_1_power_limit_uw"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|uw| uw / 1_000_000.0);
+    Some((pl1, pl2))
+}
+
+async fn detect_idle_inhibition() -> Option<String> {
+    let conn = zbus::Connection::session().await.ok()?;
+    let call = conn.call_method(
+        Some("org.gnome.SessionManager"),
+        "/org/gnome/SessionManager",
+        Some("org.gnome.SessionManager"),
+        "IsInhibited",
+        &(8u32), // INHIBIT_FLAG_IDLE = 8
+    );
+    match tokio::time::timeout(Duration::from_millis(500), call).await {
+        Ok(Ok(reply)) => {
+            if let Ok(inhibited) = reply.body().deserialize::<bool>() {
+                if inhibited {
+                    Some("Inhibited (Caffeine or active media keeping screen awake)".into())
+                } else {
+                    Some("Normal (screen sleep timeout active)".into())
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -143,10 +289,11 @@ const DEFAULT_CONFIG: &str = r#"# powerwatch configuration
 # Containers to stop on battery (restarted on AC only if powerwatch stopped them).
 containers = ["prefect-server", "prefect-postgres"]
 # Power profile used on battery (power-saver / balanced / performance).
-battery_profile = "power-saver"
+# Using 'balanced' keeps the CPU responsive and avoids heavy 400-800MHz throttling.
+battery_profile = "balanced"
 # Enable Wi-Fi powersave on the active Wi-Fi connection while on battery
 # (applies on the next reconnect; the connection is never bounced).
-wifi_powersave = true
+wifi_powersave = false
 # Desktop notifications.
 notify = true
 # Extra shell commands (run with `sh -c`).
@@ -155,6 +302,11 @@ on_ac_cmds = []
 # Low-battery warning/actions threshold; 0 disables this feature.
 low_battery_threshold = 15
 on_low_battery_cmds = []
+# Maximum power budget in Watts on battery (0 disables dynamic shedding).
+# If power draw exceeds this budget, heavy_containers are shed and on_high_power_cmds run.
+power_budget_watts = 0.0
+heavy_containers = []
+on_high_power_cmds = []
 "#;
 
 fn parse_config(s: &str) -> Result<Config, String> {
@@ -172,12 +324,20 @@ fn validate_config(cfg: &Config) -> Result<(), Vec<String>> {
     if cfg.low_battery_threshold > 100 {
         errors.push("low_battery_threshold must be between 0 and 100".into());
     }
+    if cfg.power_budget_watts < 0.0 {
+        errors.push("power_budget_watts must be non-negative".into());
+    }
     let mut seen = std::collections::HashSet::new();
     for container in &cfg.containers {
         if container.trim().is_empty() {
             errors.push("containers must not contain empty names".into());
         } else if !seen.insert(container) {
             errors.push(format!("duplicate container name: {container}"));
+        }
+    }
+    for container in &cfg.heavy_containers {
+        if container.trim().is_empty() {
+            errors.push("heavy_containers must not contain empty names".into());
         }
     }
     if errors.is_empty() {
@@ -577,6 +737,11 @@ impl<S: Sys> Ctx<S> {
                 warn!("{message}");
                 let cmds = self.cfg.on_low_battery_cmds.clone();
                 let mut notes = vec![message];
+                if let Some(idle) = detect_idle_inhibition().await
+                    && idle.contains("Inhibited")
+                {
+                    notes.push("Caffeine is currently keeping the display awake.".into());
+                }
                 self.extra_cmds(&cmds, &mut notes).await;
                 self.notify("Low battery", &notes).await;
             }
@@ -590,6 +755,81 @@ impl<S: Sys> Ctx<S> {
             }
             Ok(_) => {}
             Err(e) => warn!("read battery capacity: {e}"),
+        }
+    }
+
+    async fn check_power_budget(&mut self, on_battery: bool) {
+        if !on_battery || self.cfg.power_budget_watts <= 0.0 {
+            if self.st.high_power_shed {
+                let mut notes = Vec::new();
+                self.restore_heavy_workloads(&mut notes).await;
+            }
+            return;
+        }
+        let metrics = read_battery_metrics();
+        let Some(watts) = metrics.power_watts else {
+            return;
+        };
+        let budget = self.cfg.power_budget_watts;
+        let hysteresis = 2.0;
+
+        if watts > budget && !self.st.high_power_shed {
+            self.st.high_power_shed = true;
+            self.persist();
+            let msg = format!(
+                "Power draw ({watts:.1} W) exceeded budget ({budget:.1} W). Shedding heavy workloads."
+            );
+            warn!("{msg}");
+            let mut notes = vec![msg];
+            let heavy = self.cfg.heavy_containers.clone();
+            for c in heavy {
+                if !self.st.heavy_stopped.contains(&c)
+                    && !self.st.stopped.contains(&c)
+                    && let Ok(true) = self.container_running(&c).await
+                {
+                    if !self.dry {
+                        self.st.heavy_stopped.push(c.clone());
+                        self.persist();
+                        if self.sys.run("docker", &["stop", &c]).await.is_ok() {
+                            info!("shed heavy container {c}");
+                            notes.push(format!("shed: {c}"));
+                        }
+                    } else {
+                        notes.push(format!("[dry-run] shed: {c}"));
+                    }
+                }
+            }
+            let cmds = self.cfg.on_high_power_cmds.clone();
+            self.extra_cmds(&cmds, &mut notes).await;
+            self.notify("Power budget exceeded", &notes).await;
+        } else if watts <= (budget - hysteresis).max(0.0) && self.st.high_power_shed {
+            info!(
+                "power draw recovered to {watts:.1} W (budget {budget:.1} W); restoring heavy workloads"
+            );
+            let mut notes = Vec::new();
+            self.restore_heavy_workloads(&mut notes).await;
+            if !notes.is_empty() {
+                self.notify("Power budget restored", &notes).await;
+            }
+        }
+    }
+
+    async fn restore_heavy_workloads(&mut self, notes: &mut Vec<String>) {
+        if !self.st.high_power_shed && self.st.heavy_stopped.is_empty() {
+            return;
+        }
+        self.st.high_power_shed = false;
+        let heavy = std::mem::take(&mut self.st.heavy_stopped);
+        self.persist();
+        for c in heavy {
+            if !self.dry {
+                if self.sys.run("docker", &["start", &c]).await.is_ok() {
+                    info!("restored heavy container {c}");
+                    notes.push(format!("restored heavy container: {c}"));
+                }
+            } else {
+                notes.push(format!("[dry-run] restore heavy container: {c}"));
+            }
         }
     }
 
@@ -730,6 +970,7 @@ impl<S: Sys> Ctx<S> {
             Ok(None) => {}
             Err(e) => warn!("wifi restore: {e}"),
         }
+        self.restore_heavy_workloads(notes).await;
         if self.st.pending() {
             warn!("not everything could be restored; will retry while AC remains connected");
         }
@@ -912,6 +1153,7 @@ impl<S: Sys> Ctx<S> {
             self.on_ac().await
         }
         self.check_low_battery(on_battery).await;
+        self.check_power_budget(on_battery).await;
     }
 }
 
@@ -974,12 +1216,85 @@ async fn print_status() -> Result<(), String> {
             "AC connected"
         }
     );
-    match read_battery_capacity() {
-        Ok(Some(capacity)) => println!("Battery: {capacity}%"),
-        Ok(None) => println!("Battery: unavailable"),
-        Err(e) => println!("Battery: unavailable ({e})"),
+    let metrics = read_battery_metrics();
+    if let Some(cap) = metrics.capacity {
+        let st = metrics.status.as_deref().unwrap_or("Unknown");
+        println!("Battery: {cap}% ({st})");
+    } else {
+        println!("Battery: unavailable");
+    }
+    if let Some(p_w) = metrics.power_watts {
+        let is_discharging = metrics.status.as_deref() == Some("Discharging");
+        let is_charging = metrics.status.as_deref() == Some("Charging");
+        let time_est = if is_discharging
+            && p_w > 0.1
+            && let Some(now_wh) = metrics.energy_now_wh
+        {
+            let hours = now_wh / p_w;
+            let h = hours as u32;
+            let m = ((hours - (h as f64)) * 60.0) as u32;
+            format!(", ~{h}h {m:02}m remaining")
+        } else if is_charging
+            && p_w > 0.1
+            && let (Some(full_wh), Some(now_wh)) = (metrics.energy_full_wh, metrics.energy_now_wh)
+        {
+            let needed = full_wh - now_wh;
+            if needed > 0.0 {
+                let hours = needed / p_w;
+                let h = hours as u32;
+                let m = ((hours - (h as f64)) * 60.0) as u32;
+                format!(", ~{h}h {m:02}m until full")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        println!("Power draw: {:.2} W{}", p_w, time_est);
+    }
+    if let (Some(full), Some(design)) = (metrics.energy_full_wh, metrics.energy_full_design_wh) {
+        let health_pct = ((full / design) * 100.0).round() as u32;
+        let cycles = metrics
+            .cycle_count
+            .map(|c| format!(", {c} cycles"))
+            .unwrap_or_default();
+        println!(
+            "Battery health: {health_pct}% of design ({:.1} Wh / {:.1} Wh design{})",
+            full, design, cycles
+        );
+    }
+    if let (Some(start), Some(stop)) = (metrics.threshold_start, metrics.threshold_stop) {
+        println!("Charge thresholds: {start}% start / {stop}% stop");
     }
     println!("Power profile: {profile}");
+    if let Some(cpu_info) = read_cpu_power_status() {
+        println!("CPU status: {cpu_info}");
+    }
+    if let Some((pl1, pl2)) = read_rapl_power_limits() {
+        if let Some(short) = pl2 {
+            println!(
+                "CPU power limits: PL1 {:.1} W (sustained) / PL2 {:.1} W (burst)",
+                pl1, short
+            );
+        } else {
+            println!("CPU power limit: PL1 {:.1} W (sustained)", pl1);
+        }
+    }
+    if let Some(idle) = detect_idle_inhibition().await {
+        println!("Screen sleep: {idle}");
+    }
+    let cfg = load_config(true);
+    if cfg.power_budget_watts > 0.0 {
+        let shed_status = if state.high_power_shed {
+            "shedding active"
+        } else {
+            "within budget"
+        };
+        println!(
+            "Power budget: {:.1} W ({shed_status})",
+            cfg.power_budget_watts
+        );
+    }
     println!(
         "Pending restores: {}",
         if state.pending() { "yes" } else { "no" }
@@ -989,6 +1304,12 @@ async fn print_status() -> Result<(), String> {
     }
     if !state.stopped.is_empty() {
         println!("  containers: {}", state.stopped.join(", "));
+    }
+    if !state.heavy_stopped.is_empty() {
+        println!(
+            "  heavy containers shed: {}",
+            state.heavy_stopped.join(", ")
+        );
     }
     if let Some(connection) = &state.wifi_con {
         println!("  Wi-Fi connection: {connection}");
@@ -1121,6 +1442,7 @@ async fn main() {
 
     let mut stream = proxy.receive_on_battery_changed().await;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
     let mut applied = cur;
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut poll = tokio::time::interval(POLL);
@@ -1142,16 +1464,16 @@ async fn main() {
             ch = stream.next() => {
                 match ch {
                     Some(c) => {
-                        if let Ok(v) = c.get().await {
-                            if v != cur {
-                                cur = v;
-                                info!("OnBattery changed -> {v}; debouncing {}s", DEBOUNCE.as_secs());
-                                deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
-                                if flap_detector.observe(Instant::now()) {
-                                    let notes = vec!["The AC/battery status has changed repeatedly. Check the charger, cable, and USB-C port.".into()];
-                                    warn!("power source is flapping; notification throttled for {} minutes", FLAP_ALERT_COOLDOWN.as_secs() / 60);
-                                    ctx.notify("Unstable charging connection", &notes).await;
-                                }
+                        if let Ok(v) = c.get().await
+                            && v != cur
+                        {
+                            cur = v;
+                            info!("OnBattery changed -> {v}; debouncing {}s", DEBOUNCE.as_secs());
+                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                            if flap_detector.observe(Instant::now()) {
+                                let notes = vec!["The AC/battery status has changed repeatedly. Check the charger, cable, and USB-C port.".into()];
+                                warn!("power source is flapping; notification throttled for {} minutes", FLAP_ALERT_COOLDOWN.as_secs() / 60);
+                                ctx.notify("Unstable charging connection", &notes).await;
                             }
                         }
                     }
@@ -1188,6 +1510,7 @@ async fn main() {
                 }
                 if deadline.is_none() {
                     ctx.check_low_battery(cur).await;
+                    ctx.check_power_budget(cur).await;
                 }
             }
             _ = restore_retry.tick() => {
@@ -1209,6 +1532,21 @@ async fn main() {
                     applied = cur;
                 } else {
                     info!("state settled back to {}; nothing to do", if cur { "battery" } else { "AC" });
+                }
+            }
+            _ = async { match hup.as_mut() { Some(h) => { h.recv().await; } None => std::future::pending().await } } => {
+                info!("SIGHUP: reloading configuration");
+                let new_cfg = load_config(ctx.dry);
+                if let Err(errors) = validate_config(&new_cfg) {
+                    for e in errors {
+                        err!("reloaded config invalid: {e}");
+                    }
+                } else {
+                    ctx.cfg = new_cfg;
+                    info!("configuration successfully reloaded");
+                    if cur {
+                        ctx.check_power_budget(cur).await;
+                    }
                 }
             }
             _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {
@@ -1319,8 +1657,8 @@ mod tests {
         let c = parse_config("containers = [\"a\"]\nnotify = false").unwrap();
         assert_eq!(c.containers, vec!["a"]);
         assert!(!c.notify);
-        assert_eq!(c.battery_profile, "power-saver");
-        assert!(c.wifi_powersave);
+        assert_eq!(c.battery_profile, "balanced");
+        assert!(!c.wifi_powersave);
         assert!(parse_config("containers = 5").is_err());
     }
 
@@ -1480,6 +1818,8 @@ containers = ["db", "db", ""]"#,
         f.reply(LIST, Ok(WIFI_LIST));
         f.reply(PS, Ok("default"));
         let mut c = ctx(&f, "cycle", State::default());
+        c.cfg.battery_profile = "power-saver".into();
+        c.cfg.wifi_powersave = true;
         c.apply(true).await;
         assert_eq!(c.st.prev_profile.as_deref(), Some("balanced"));
         assert_eq!(c.st.stopped, vec!["prefect-server", "prefect-postgres"]);
@@ -1559,11 +1899,11 @@ containers = ["db", "db", ""]"#,
     #[tokio::test]
     async fn does_not_restore_what_it_did_not_change() {
         let f = Fake::default();
-        *f.profile.borrow_mut() = "power-saver".into(); // user was already on power-saver
+        *f.profile.borrow_mut() = "balanced".into(); // user was already on balanced
         running(&f, "prefect-server", false); // user had them stopped
         running(&f, "prefect-postgres", false);
         f.reply(LIST, Ok(WIFI_LIST));
-        f.reply(PS, Ok("enable")); // user already had powersave enabled
+        f.reply(PS, Ok("enable"));
         let mut c = ctx(&f, "untouched", State::default());
         c.apply(true).await;
         assert!(!c.st.pending(), "{:?}", c.st);
@@ -1864,5 +2204,30 @@ containers = ["db", "db", ""]"#,
         };
         c.apply(true).await;
         assert!(f.notes.borrow().is_empty());
+    }
+
+    #[test]
+    fn power_budget_config_validation() {
+        let mut cfg = Config::default();
+        cfg.power_budget_watts = -5.0;
+        assert!(validate_config(&cfg).is_err());
+        cfg.power_budget_watts = 15.0;
+        cfg.heavy_containers = vec!["".into()];
+        assert!(validate_config(&cfg).is_err());
+        cfg.heavy_containers = vec!["build-agent".into()];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn state_pending_includes_heavy_stopped() {
+        let mut st = State::default();
+        assert!(!st.pending());
+        st.heavy_stopped.push("heavy-db".into());
+        assert!(st.pending());
+    }
+
+    #[test]
+    fn rapl_power_limits_smoke() {
+        let _ = read_rapl_power_limits();
     }
 }
