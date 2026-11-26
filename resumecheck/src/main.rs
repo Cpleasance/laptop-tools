@@ -758,20 +758,23 @@ fn parse_history_stats(content: &str) -> HistoryStats {
     }
 }
 
-fn print_status(cfg: &Config) {
+#[derive(Serialize)]
+struct ResumecheckStatusJson<'a> {
+    config_file: String,
+    delay_secs: u64,
+    dns_window_secs: u64,
+    notify_ok: bool,
+    active_checks: Vec<&'a str>,
+    auto_reset_units: Vec<String>,
+    history_total: usize,
+    history_ok: usize,
+    history_issues: usize,
+    clean_pct: usize,
+    last_event: Option<String>,
+}
+
+fn print_status(cfg: &Config, json: bool) {
     let p = config_path();
-    println!(
-        "resumecheck configuration ({}):",
-        if p.exists() {
-            p.display().to_string()
-        } else {
-            "defaults".to_string()
-        }
-    );
-    println!(
-        "  post-resume delay: {}s | DNS retry window: {}s | notify_ok: {}",
-        cfg.delay_secs, cfg.dns_window_secs, cfg.notify_ok
-    );
     let mut checks = Vec::new();
     if cfg.check_opensnitch {
         checks.push("opensnitch");
@@ -791,6 +794,60 @@ fn print_status(cfg: &Config) {
     if cfg.check_bluetooth {
         checks.push("bluetooth");
     }
+
+    let hp = history_path();
+    let stats = if let Ok(content) = std::fs::read_to_string(&hp) {
+        parse_history_stats(&content)
+    } else {
+        HistoryStats {
+            total: 0,
+            ok: 0,
+            issues: 0,
+            last: None,
+        }
+    };
+    let clean_pct = stats
+        .ok
+        .checked_mul(100)
+        .and_then(|v| v.checked_div(stats.total))
+        .unwrap_or(100);
+
+    if json {
+        let status_json = ResumecheckStatusJson {
+            config_file: if p.exists() {
+                p.display().to_string()
+            } else {
+                "defaults".to_string()
+            },
+            delay_secs: cfg.delay_secs,
+            dns_window_secs: cfg.dns_window_secs,
+            notify_ok: cfg.notify_ok,
+            active_checks: checks,
+            auto_reset_units: cfg.auto_reset_failed_units.clone(),
+            history_total: stats.total,
+            history_ok: stats.ok,
+            history_issues: stats.issues,
+            clean_pct,
+            last_event: stats.last,
+        };
+        if let Ok(j) = serde_json::to_string_pretty(&status_json) {
+            println!("{j}");
+        }
+        return;
+    }
+
+    println!(
+        "resumecheck configuration ({}):",
+        if p.exists() {
+            p.display().to_string()
+        } else {
+            "defaults".to_string()
+        }
+    );
+    println!(
+        "  post-resume delay: {}s | DNS retry window: {}s | notify_ok: {}",
+        cfg.delay_secs, cfg.dns_window_secs, cfg.notify_ok
+    );
     println!("  active checks: {}", checks.join(", "));
     if !cfg.auto_reset_failed_units.is_empty() {
         println!(
@@ -798,21 +855,14 @@ fn print_status(cfg: &Config) {
             cfg.auto_reset_failed_units.join(", ")
         );
     }
-    let hp = history_path();
-    if let Ok(content) = std::fs::read_to_string(&hp) {
-        let stats = parse_history_stats(&content);
+    if hp.exists() {
         println!("\nResume history ({}):", hp.display());
         if stats.total == 0 {
             println!("  no resume events recorded yet");
         } else {
-            let pct = stats
-                .ok
-                .checked_mul(100)
-                .and_then(|v| v.checked_div(stats.total))
-                .unwrap_or(100);
             println!(
                 "  total resumes recorded: {} ({} ok, {} with issues — {}% clean)",
-                stats.total, stats.ok, stats.issues, pct
+                stats.total, stats.ok, stats.issues, clean_pct
             );
             if let Some(last) = stats.last {
                 println!("  last event: {last}");
@@ -860,16 +910,16 @@ fn check_config_file() -> Result<bool, String> {
     Ok(true)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 enum CommandMode {
     Daemon,
     Now { since: Option<String> },
-    Status,
+    Status { json: bool },
     History { limit: usize },
     CheckConfig,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
     mode: CommandMode,
 }
@@ -878,6 +928,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     let mut mode = None;
     let mut since = None;
     let mut history_limit = 15;
+    let mut status_json = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -894,10 +945,13 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 since = Some(s["--since=".len()..].to_owned());
             }
             "status" | "--status" => {
-                if mode.is_some() {
+                if mode.is_some() && !matches!(mode, Some(CommandMode::Status { .. })) {
                     return Err("conflicting commands specified".into());
                 }
-                mode = Some(CommandMode::Status);
+                mode = Some(CommandMode::Status { json: false });
+            }
+            "--json" => {
+                status_json = true;
             }
             "history" | "--history" => {
                 if mode.is_some() {
@@ -929,7 +983,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: resumecheck [--now [--since <time spec>]] | resumecheck status | resumecheck history [--limit N] | resumecheck check-config"
+                    "usage: resumecheck [--now [--since <time spec>]] | resumecheck status [--json] | resumecheck history [--limit N] | resumecheck check-config"
                 );
                 std::process::exit(0);
             }
@@ -939,6 +993,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
 
     let final_mode = match mode {
         Some(CommandMode::Now { .. }) => CommandMode::Now { since },
+        Some(CommandMode::Status { .. }) => CommandMode::Status { json: status_json },
         Some(CommandMode::History { .. }) => CommandMode::History {
             limit: history_limit,
         },
@@ -951,6 +1006,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
         None => {
             if since.is_some() {
                 CommandMode::Now { since }
+            } else if status_json {
+                CommandMode::Status { json: true }
             } else {
                 CommandMode::Daemon
             }
@@ -962,13 +1019,13 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
-        eprintln!("{e}\nusage: resumecheck [--now [--since <journalctl time spec>]] | resumecheck status | resumecheck history [--limit N] | resumecheck check-config");
+        eprintln!("{e}\nusage: resumecheck [--now [--since <journalctl time spec>]] | resumecheck status [--json] | resumecheck history [--limit N] | resumecheck check-config");
         std::process::exit(2);
     });
     let cfg = load_config();
     match args.mode {
-        CommandMode::Status => {
-            print_status(&cfg);
+        CommandMode::Status { json } => {
+            print_status(&cfg, json);
         }
         CommandMode::History { limit } => {
             print_history(limit);
@@ -1248,13 +1305,19 @@ mod tests {
         assert_eq!(
             a(&["status"]).unwrap(),
             Args {
-                mode: CommandMode::Status
+                mode: CommandMode::Status { json: false }
+            }
+        );
+        assert_eq!(
+            a(&["status", "--json"]).unwrap(),
+            Args {
+                mode: CommandMode::Status { json: true }
             }
         );
         assert_eq!(
             a(&["--status"]).unwrap(),
             Args {
-                mode: CommandMode::Status
+                mode: CommandMode::Status { json: false }
             }
         );
         assert_eq!(

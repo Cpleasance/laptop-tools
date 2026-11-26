@@ -1,0 +1,10 @@
+[package]
+name = "dockwatch"
+version = "0.1.0"
+edition = "2024"
+description = "Thunderbolt / USB-C dock and external display hotplug monitor for Linux laptops"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "process", "signal"] }

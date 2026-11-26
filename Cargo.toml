@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["powerwatch", "resumecheck"]
+members = [
+    "powerwatch",
+    "resumecheck",
+    "thresholdctl",
+    "thermalwatch",
+    "dockwatch",
+    "audiopop-fix",
+]
 
 [profile.release]
 opt-level = "s"

@@ -1193,7 +1193,25 @@ async fn connect() -> zbus::Result<(UPowerProxy<'static>, UPowerProxy<'static>)>
     Ok((p, poll))
 }
 
-async fn print_status() -> Result<(), String> {
+#[derive(Serialize)]
+struct PowerwatchStatusJson<'a> {
+    on_battery: bool,
+    power_state: &'static str,
+    battery_pct: Option<u8>,
+    battery_status: Option<String>,
+    power_watts: Option<f64>,
+    health_pct: Option<u32>,
+    charge_threshold_start: Option<u8>,
+    charge_threshold_stop: Option<u8>,
+    power_profile: &'a str,
+    cpu_status: Option<String>,
+    rapl_pl1_w: Option<f64>,
+    rapl_pl2_w: Option<f64>,
+    screen_sleep: Option<String>,
+    pending_restores: bool,
+}
+
+async fn print_status(json: bool) -> Result<(), String> {
     let (proxy, _) = connect()
         .await
         .map_err(|e| format!("cannot reach UPower: {e}"))?;
@@ -1208,6 +1226,45 @@ async fn print_status() -> Result<(), String> {
     .await
     .map_err(|e| format!("read power profile: {e}"))?;
     let state = load_state_from(&state_path(), true);
+    let metrics = read_battery_metrics();
+    let rapl = read_rapl_power_limits();
+    let cpu_info = read_cpu_power_status();
+    let idle = detect_idle_inhibition().await;
+
+    if json {
+        let health_pct = if let (Some(full), Some(design)) =
+            (metrics.energy_full_wh, metrics.energy_full_design_wh)
+        {
+            Some(((full / design) * 100.0).round() as u32)
+        } else {
+            None
+        };
+        let status_json = PowerwatchStatusJson {
+            on_battery,
+            power_state: if on_battery {
+                "on battery"
+            } else {
+                "AC connected"
+            },
+            battery_pct: metrics.capacity,
+            battery_status: metrics.status.clone(),
+            power_watts: metrics.power_watts,
+            health_pct,
+            charge_threshold_start: metrics.threshold_start,
+            charge_threshold_stop: metrics.threshold_stop,
+            power_profile: &profile,
+            cpu_status: cpu_info,
+            rapl_pl1_w: rapl.map(|(p1, _)| p1),
+            rapl_pl2_w: rapl.and_then(|(_, p2)| p2),
+            screen_sleep: idle,
+            pending_restores: state.pending(),
+        };
+        if let Ok(j) = serde_json::to_string_pretty(&status_json) {
+            println!("{j}");
+        }
+        return Ok(());
+    }
+
     println!(
         "Power state: {}",
         if on_battery {
@@ -1216,7 +1273,6 @@ async fn print_status() -> Result<(), String> {
             "AC connected"
         }
     );
-    let metrics = read_battery_metrics();
     if let Some(cap) = metrics.capacity {
         let st = metrics.status.as_deref().unwrap_or("Unknown");
         println!("Battery: {cap}% ({st})");
@@ -1267,10 +1323,10 @@ async fn print_status() -> Result<(), String> {
         println!("Charge thresholds: {start}% start / {stop}% stop");
     }
     println!("Power profile: {profile}");
-    if let Some(cpu_info) = read_cpu_power_status() {
-        println!("CPU status: {cpu_info}");
+    if let Some(cpu_info_str) = cpu_info {
+        println!("CPU status: {cpu_info_str}");
     }
-    if let Some((pl1, pl2)) = read_rapl_power_limits() {
+    if let Some((pl1, pl2)) = rapl {
         if let Some(short) = pl2 {
             println!(
                 "CPU power limits: PL1 {:.1} W (sustained) / PL2 {:.1} W (burst)",
@@ -1280,8 +1336,8 @@ async fn print_status() -> Result<(), String> {
             println!("CPU power limit: PL1 {:.1} W (sustained)", pl1);
         }
     }
-    if let Some(idle) = detect_idle_inhibition().await {
-        println!("Screen sleep: {idle}");
+    if let Some(idle_str) = idle {
+        println!("Screen sleep: {idle_str}");
     }
     let cfg = load_config(true);
     if cfg.power_budget_watts > 0.0 {
@@ -1346,21 +1402,23 @@ async fn main() {
     let mut once = false;
     let mut status = false;
     let mut check_config = false;
+    let mut json = false;
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--dry-run" => dry = true,
             "--once" => once = true,
             "status" | "--status" => status = true,
+            "--json" => json = true,
             "check-config" | "--check-config" => check_config = true,
             "-h" | "--help" => {
                 println!(
-                    "usage: powerwatch [--dry-run] [--once] | powerwatch status | powerwatch check-config"
+                    "usage: powerwatch [--dry-run] [--once] | powerwatch status [--json] | powerwatch check-config"
                 );
                 return;
             }
             o => {
                 eprintln!(
-                    "unknown argument: {o}\nusage: powerwatch [--dry-run] [--once] | powerwatch status | powerwatch check-config"
+                    "unknown argument: {o}\nusage: powerwatch [--dry-run] [--once] | powerwatch status [--json] | powerwatch check-config"
                 );
                 std::process::exit(2);
             }
@@ -1371,7 +1429,7 @@ async fn main() {
         std::process::exit(2);
     }
     if status {
-        if let Err(e) = print_status().await {
+        if let Err(e) = print_status(json).await {
             eprintln!("powerwatch status: {e}");
             std::process::exit(1);
         }

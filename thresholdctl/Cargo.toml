@@ -1,0 +1,9 @@
+[package]
+name = "thresholdctl"
+version = "0.1.0"
+edition = "2024"
+description = "Fast CLI for managing ThinkPad & Linux laptop battery charge thresholds"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
