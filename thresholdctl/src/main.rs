@@ -164,6 +164,73 @@ pub fn validate_thresholds(start: u8, stop: u8) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn validate_sysfs_threshold_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    if !s.starts_with("/sys/class/power_supply/") {
+        return false;
+    }
+    if s.contains("..") || s.contains('\0') || s.contains('\n') {
+        return false;
+    }
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(
+        filename,
+        "charge_control_start_threshold"
+            | "charge_start_threshold"
+            | "charge_control_end_threshold"
+            | "charge_stop_threshold"
+    )
+}
+
+fn write_threshold_elevated(path: &Path, val: u8) -> bool {
+    if !validate_sysfs_threshold_path(path) {
+        return false;
+    }
+
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Try sudo tee <path> without shell interpolation
+    if let Ok(mut child) = Command::new("sudo")
+        .arg("tee")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{val}");
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
+        {
+            return true;
+        }
+    }
+
+    // Try pkexec tee <path> fallback
+    if let Ok(mut child) = Command::new("pkexec")
+        .arg("tee")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{val}");
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn apply_thresholds(bat_path: &Path, start: u8, stop: u8) -> Result<(), String> {
     validate_thresholds(start, stop).map_err(|e| e.to_string())?;
 
@@ -197,35 +264,7 @@ pub fn apply_thresholds(bat_path: &Path, start: u8, stop: u8) -> Result<(), Stri
             )
         );
 
-        let cmd_str = format!(
-            "echo {start} > {} && echo {stop} > {}",
-            start_path.display(),
-            stop_path.display()
-        );
-
-        // Try sudo first
-        let status = Command::new("sudo")
-            .arg("sh")
-            .arg("-c")
-            .arg(&cmd_str)
-            .status();
-
-        if let Ok(s) = status
-            && s.success()
-        {
-            return Ok(());
-        }
-
-        // Try pkexec fallback
-        let pk_status = Command::new("pkexec")
-            .arg("sh")
-            .arg("-c")
-            .arg(&cmd_str)
-            .status();
-
-        if let Ok(s) = pk_status
-            && s.success()
-        {
+        if write_threshold_elevated(&start_path, start) && write_threshold_elevated(&stop_path, stop) {
             return Ok(());
         }
     }
@@ -498,5 +537,26 @@ mod tests {
         assert!(s.contains("\"start_threshold\":75"));
         assert!(s.contains("\"stop_threshold\":80"));
         assert!(s.contains("\"writable\":true"));
+    }
+
+    #[test]
+    fn test_validate_sysfs_threshold_path() {
+        assert!(validate_sysfs_threshold_path(Path::new(
+            "/sys/class/power_supply/BAT0/charge_control_start_threshold"
+        )));
+        assert!(validate_sysfs_threshold_path(Path::new(
+            "/sys/class/power_supply/BAT1/charge_stop_threshold"
+        )));
+
+        // Path traversal / outside sysfs
+        assert!(!validate_sysfs_threshold_path(Path::new(
+            "/sys/class/power_supply/../etc/passwd"
+        )));
+        assert!(!validate_sysfs_threshold_path(Path::new(
+            "/tmp/charge_control_start_threshold"
+        )));
+        assert!(!validate_sysfs_threshold_path(Path::new(
+            "/sys/class/power_supply/BAT0/arbitrary_file"
+        )));
     }
 }
