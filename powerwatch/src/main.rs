@@ -2266,8 +2266,10 @@ containers = ["db", "db", ""]"#,
 
     #[test]
     fn power_budget_config_validation() {
-        let mut cfg = Config::default();
-        cfg.power_budget_watts = -5.0;
+        let mut cfg = Config {
+            power_budget_watts: -5.0,
+            ..Default::default()
+        };
         assert!(validate_config(&cfg).is_err());
         cfg.power_budget_watts = 15.0;
         cfg.heavy_containers = vec!["".into()];

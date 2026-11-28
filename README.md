@@ -1,5 +1,10 @@
 # ThinkPad PowerWatch 🔋 — Rust Daemons for Linux Battery Scaling (EPP) & Sleep Recovery
 
+[![CI](https://github.com/Cpleasance/laptop-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Cpleasance/laptop-tools/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange?logo=rust)](https://www.rust-lang.org)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-blue?logo=linux)](https://github.com/Cpleasance/laptop-tools)
+
 A unified suite of high-performance, unprivileged Rust daemons for Linux laptops (engineered for Lenovo ThinkPad running Fedora/GNOME/systemd, but portable across all modern Linux distributions). Fixes aggressive 400 MHz EPP throttling on battery unplug, sleep resume driver drops, and Li-ion charging cycle wear.
 
 All tools run unprivileged in user space, support `--json` for integration with desktop status bars (Waybar, Polybar, GNOME Shell extensions), and honor the standard `NO_COLOR` specification.

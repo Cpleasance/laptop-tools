@@ -9,6 +9,15 @@ members = [
     "audiopop-fix",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Cory Pleasance"]
+license = "MIT"
+repository = "https://github.com/Cpleasance/laptop-tools"
+homepage = "https://corypleasance.com/posts/fixing-linux-battery-stutter-with-rust"
+readme = "README.md"
+
 [profile.release]
 opt-level = "s"
 lto = true

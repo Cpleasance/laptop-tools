@@ -421,6 +421,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_battery_path_discovery_smoke() {
+        let bat = find_battery_path();
+        if let Some(ref p) = bat {
+            assert!(p.exists());
+            assert!(p.starts_with("/sys/class/power_supply"));
+            let start = read_threshold_file(
+                p,
+                &["charge_control_start_threshold", "charge_start_threshold"],
+            );
+            let stop = read_threshold_file(
+                p,
+                &["charge_control_end_threshold", "charge_stop_threshold"],
+            );
+            if let (Some(s), Some(e)) = (start, stop) {
+                assert!(s <= 100);
+                assert!(e <= 100);
+            }
+        }
+    }
+
+    #[test]
     fn test_validate_thresholds() {
         assert!(validate_thresholds(75, 80).is_ok());
         assert!(validate_thresholds(95, 100).is_ok());
